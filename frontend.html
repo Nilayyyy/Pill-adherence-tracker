@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pill Adherence Checker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f3f4f6; }
+        .container { max-width: 100vw; }
+        .camera-container { position: relative; }
+        #videoElement { width: 100%; height: auto; border-radius: 0.5rem; }
+        #canvasOutput { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 0.5rem; }
+        .schedule-table { width: 100%; border-collapse: collapse; text-align: left; }
+        .schedule-table th, .schedule-table td { padding: 0.75rem; border-bottom: 1px solid #e5e7eb; }
+        .schedule-table th { background-color: #f9fafb; font-weight: 600; }
+        .message-box { min-height: 8rem; }
+    </style>
+</head>
+<body class="bg-gray-100 flex items-center justify-center min-h-screen">
+
+<div class="container bg-white p-6 rounded-lg shadow-xl m-4">
+    <h1 class="text-3xl font-bold text-center text-gray-800 mb-6">Pill Adherence Checker</h1>
+
+    <div class="camera-container mb-6 rounded-lg shadow-inner border-4 border-gray-300">
+        <video id="videoElement" autoplay playsinline class="w-full"></video>
+        <canvas id="canvasOutput" class="w-full"></canvas>
+    </div>
+
+    <div class="flex flex-col md:flex-row justify-between items-center mb-6 space-y-4 md:space-y-0 md:space-x-4">
+        <div class="bg-gray-50 p-4 rounded-md shadow-md w-full md:w-1/3 text-center">
+            <h2 class="text-lg font-semibold text-gray-700">Pills Detected</h2>
+            <span id="pillCount" class="text-4xl font-bold text-blue-600">0</span>
+        </div>
+        <div class="bg-gray-50 p-4 rounded-md shadow-md w-full md:w-1/3 text-center">
+            <h2 class="text-lg font-semibold text-gray-700">Current Time</h2>
+            <span id="currentTime" class="text-2xl font-semibold text-gray-600"></span>
+        </div>
+        <div class="bg-gray-50 p-4 rounded-md shadow-md w-full md:w-1/3 text-center">
+            <h2 class="text-lg font-semibold text-gray-700">Patient ID</h2>
+            <span id="userId" class="text-sm font-medium text-gray-500">Loading...</span>
+        </div>
+    </div>
+
+    <div class="space-y-6">
+        <div class="bg-gray-50 p-6 rounded-lg shadow-md">
+            <h2 class="text-xl font-bold text-gray-800 mb-4 text-center">Medication Schedule</h2>
+            <div id="scheduleContainer" class="overflow-x-auto">
+                <table id="scheduleTable" class="schedule-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Pills Due</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="scheduleBody">
+                        </tbody>
+                </table>
+            </div>
+            <div class="mt-4 text-center">
+                <button id="updateScheduleButton" class="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-full shadow transition-all">Update Schedule</button>
+            </div>
+        </div>
+
+        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg relative message-box hidden" role="alert" id="alertBox">
+            <strong class="font-bold">Missed Dose!</strong>
+            <span class="block sm:inline" id="alertMessage"></span>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/yolo-js@0.1.1/dist/yolo.min.js"></script>
+<script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // Global variables provided by the environment
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { /* Your Firebase config here */ };
+    const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+    // Firebase Initialization
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+    const auth = getAuth(app);
+    let userId;
+
+    // Application State
+    const schedule = {};
+    const video = document.getElementById('videoElement');
+    const canvas = document.getElementById('canvasOutput');
+    const ctx = canvas.getContext('2d');
+    let model = null;
+    let cameraStream = null;
+    let lastKnownCount = 0;
+    const timeZone = 'Asia/Kolkata'; // Assuming location is India for time zone
+
+    // UI elements
+    const pillCountSpan = document.getElementById('pillCount');
+    const currentTimeSpan = document.getElementById('currentTime');
+    const userIdSpan = document.getElementById('userId');
+    const scheduleBody = document.getElementById('scheduleBody');
+    const alertBox = document.getElementById('alertBox');
+    const alertMessage = document.getElementById('alertMessage');
+    const updateScheduleButton = document.getElementById('updateScheduleButton');
+
+    // Model and Label Configuration
+    const modelPath = 'https://raw.githubusercontent.com/Nilayyyy/Pill-adherence-monitor-model/main/best.onnx'; // Replace with a hosted URL for your model.json file
+    const labels = ['pill']; // Your single class name
+
+    // Helper function to handle async operations and retries
+    const withRetry = async (fn, retries = 5, delay = 1000) => {
+        for (let i = 0; i < retries; i++) {
+            try {
+                return await fn();
+            } catch (error) {
+                console.error(`Attempt ${i + 1} failed:`, error);
+                if (i < retries - 1) {
+                    await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
+                } else {
+                    throw error;
+                }
+            }
+        }
+    };
+
+    // Firebase Authentication
+    const signIn = async () => {
+        try {
+            if (initialAuthToken) {
+                await signInWithCustomToken(auth, initialAuthToken);
+            } else {
+                await signInAnonymously(auth);
+            }
+            userId = auth.currentUser.uid;
+            userIdSpan.textContent = userId;
+            console.log("Firebase signed in. User ID:", userId);
+        } catch (error) {
+            console.error("Firebase sign-in failed:", error);
+            userIdSpan.textContent = "Sign-in Failed";
+        }
+    };
+
+    // --- Firestore Operations ---
+    const getSchedule = async () => {
+        const scheduleRef = doc(db, `artifacts/${appId}/users/${userId}/schedule`, 'medication-schedule');
+        const docSnap = await getDoc(scheduleRef);
+        if (docSnap.exists()) {
+            Object.assign(schedule, docSnap.data());
+        } else {
+            // Set a default schedule if none exists
+            const defaultSchedule = {
+                '2:00 PM': { expectedCount: 2, taken: false, lastChecked: null },
+                '8:00 PM': { expectedCount: 1, taken: false, lastChecked: null }
+            };
+            await setDoc(scheduleRef, defaultSchedule);
+            Object.assign(schedule, defaultSchedule);
+        }
+        renderScheduleTable();
+    };
+    
+    // Function to update the schedule when a dose is taken
+    const updateScheduleStatus = async (timeSlot, newCount) => {
+        const timeKey = Object.keys(schedule).find(key => key === timeSlot);
+        if (timeKey) {
+            const expectedCount = schedule[timeKey].expectedCount;
+            // Check if the pill count has reduced by the expected amount
+            const originalCount = schedule[timeKey].lastKnownCount !== null ? schedule[timeKey].lastKnownCount : expectedCount;
+            
+            if (newCount <= (originalCount - expectedCount)) {
+                schedule[timeKey].taken = true;
+                const scheduleRef = doc(db, `artifacts/${appId}/users/${userId}/schedule`, 'medication-schedule');
+                await setDoc(scheduleRef, schedule, { merge: true });
+                renderScheduleTable();
+                console.log(`Dose for ${timeKey} has been taken.`);
+            }
+        }
+    };
+
+    // --- UI Rendering ---
+    const renderScheduleTable = () => {
+        scheduleBody.innerHTML = '';
+        for (const time in schedule) {
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td class="font-medium text-gray-700">${time}</td>
+                <td>${schedule[time].expectedCount} pills</td>
+                <td>
+                    <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${schedule[time].taken ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}">
+                        ${schedule[time].taken ? 'Taken' : 'Pending'}
+                    </span>
+                </td>
+            `;
+            scheduleBody.appendChild(row);
+        }
+    };
+
+    // --- Camera and Model Functions ---
+    const startCamera = async () => {
+        try {
+            cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+            video.srcObject = cameraStream;
+            video.addEventListener('loadedmetadata', () => {
+                video.play();
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                requestAnimationFrame(detectPills);
+            });
+        } catch (error) {
+            console.error('Error accessing webcam:', error);
+            alertBox.classList.remove('hidden');
+            alertMessage.textContent = 'Could not access the webcam. Please ensure permissions are granted.';
+        }
+    };
+
+    const loadModel = async () => {
+        try {
+            model = new YOLO(modelPath, labels);
+            await model.init();
+            console.log('Model loaded successfully!');
+        } catch (error) {
+            console.error('Failed to load the model:', error);
+            alertBox.classList.remove('hidden');
+            alertMessage.textContent = 'Failed to load the pill detection model.';
+        }
+    };
+
+    const detectPills = async () => {
+        if (video.readyState === video.HAVE_ENOUGH_DATA && model) {
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const predictions = await model.predict(imageData);
+
+            // Clear canvas and draw new predictions
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            // Draw bounding boxes
+            predictions.forEach(p => {
+                const [x, y, width, height] = p.box;
+                ctx.beginPath();
+                ctx.lineWidth = "4";
+                ctx.strokeStyle = p.label === 'pill' ? "green" : "red";
+                ctx.rect(x, y, width, height);
+                ctx.stroke();
+
+                ctx.font = '24px Arial';
+                ctx.fillStyle = p.label === 'pill' ? "green" : "red";
+                ctx.fillText(p.label, x, y > 10 ? y - 5 : 10);
+            });
+
+            const currentCount = predictions.filter(p => p.label === 'pill').length;
+            pillCountSpan.textContent = currentCount;
+            lastKnownCount = currentCount;
+
+            // Check for missed dose
+            checkAdherence();
+            
+            // Re-render schedule with updated count if applicable
+            for (const time in schedule) {
+                if (!schedule[time].taken && isOverdue(time)) {
+                    if (schedule[time].lastKnownCount === null) {
+                        schedule[time].lastKnownCount = currentCount;
+                    }
+                    if (currentCount < schedule[time].lastKnownCount) {
+                        updateScheduleStatus(time, currentCount);
+                    }
+                }
+            }
+        }
+        requestAnimationFrame(detectPills);
+    };
+
+    // --- Scheduling Logic ---
+    const isOverdue = (time) => {
+        const now = new Date(new Date().toLocaleString('en-US', { timeZone }));
+        const [timePart, ampm] = time.split(' ');
+        let [hours, minutes] = timePart.split(':');
+        hours = parseInt(hours);
+        if (ampm === 'PM' && hours < 12) {
+            hours += 12;
+        }
+        if (ampm === 'AM' && hours === 12) {
+            hours = 0;
+        }
+        const dueTime = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hours, minutes);
+        const overdueTime = new Date(dueTime.getTime() + 60 * 60 * 1000); // 1 hour grace period
+        
+        return now > overdueTime;
+    };
+
+    const checkAdherence = () => {
+        for (const time in schedule) {
+            const dose = schedule[time];
+            if (!dose.taken && isOverdue(time)) {
+                // Trigger alert for the caregiver
+                alertBox.classList.remove('hidden');
+                alertMessage.textContent = ` Patient has missed their ${time} dose of ${dose.expectedCount} pills. Please check on them.`;
+            }
+        }
+    };
+
+    const updateClock = () => {
+        const now = new Date(new Date().toLocaleString('en-US', { timeZone }));
+        currentTimeSpan.textContent = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+    };
+
+    // --- Main Execution ---
+    window.onload = async () => {
+        // Sign in anonymously and load data
+        await signIn();
+        await getSchedule();
+        
+        // Start camera and model
+        await Promise.all([startCamera(), loadModel()]);
+        
+        // Update the clock every second
+        setInterval(updateClock, 1000);
+
+        // UI Event Listener
+        updateScheduleButton.addEventListener('click', async () => {
+            const newSchedule = {
+                '2:00 PM': { expectedCount: 2, taken: false, lastKnownCount: null },
+                '8:00 PM': { expectedCount: 1, taken: false, lastKnownCount: null }
+            };
+            const scheduleRef = doc(db, `artifacts/${appId}/users/${userId}/schedule`, 'medication-schedule');
+            await setDoc(scheduleRef, newSchedule);
+            Object.assign(schedule, newSchedule);
+            renderScheduleTable();
+            alertBox.classList.add('hidden'); // Hide alert after reset
+            alertMessage.textContent = '';
+        });
+        
+    };
+
+</script>
+
+</body>
+</html>
